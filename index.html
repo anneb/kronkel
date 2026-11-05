@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#05050f">
+<title>Kronkel</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; background: #05050f; color: #fff;
+    font-family: system-ui, -apple-system, sans-serif;
+    overflow: hidden; touch-action: none;
+    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+    overscroll-behavior: none;
+  }
+  #hud {
+    position: fixed; top: 0; left: 0; right: 0;
+    padding: calc(env(safe-area-inset-top) + 6px) 8px 6px;
+    display: flex; justify-content: space-around; align-items: center;
+    font: bold 14px/1.2 ui-monospace, Menlo, Consolas, monospace;
+    background: #0b0b1e; border-bottom: 2px solid #2a2a55; z-index: 2;
+  }
+  #hud span b { color: #8ff; }
+  #pctbar { position: relative; width: 70px; height: 10px; border: 1px solid #556; display: inline-block; vertical-align: middle; margin-left: 4px; }
+  #pctfill { position: absolute; left: 0; top: 0; bottom: 0; background: #4f8; width: 0; }
+  #pctmark { position: absolute; top: -3px; bottom: -3px; width: 2px; background: #fff; left: 75%; }
+  canvas { position: fixed; left: 0; display: block; }
+  #overlay {
+    position: fixed; inset: 0; z-index: 5; display: flex; align-items: center; justify-content: center;
+    background: rgba(3, 3, 12, .82); text-align: center; padding: 20px; box-sizing: border-box;
+  }
+  #overlay.hidden { display: none; }
+  #panel { max-width: 420px; }
+  #panel h1 {
+    font: 900 52px/1 ui-monospace, Menlo, Consolas, monospace; margin: 0 0 14px; letter-spacing: 4px;
+    background: linear-gradient(90deg, #f0f, #0ff, #ff0); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  #panel h2 { font: bold 28px ui-monospace, monospace; margin: 0 0 12px; color: #ff0; }
+  #panel p { color: #ccd; font-size: 16px; line-height: 1.45; margin: 8px 0; }
+  #panel button {
+    margin-top: 18px; font: bold 22px ui-monospace, monospace; padding: 14px 34px;
+    background: #f0f; color: #000; border: 0; border-radius: 10px; box-shadow: 0 0 22px #f0f8;
+  }
+  .small { font-size: 13px !important; color: #889 !important; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <span>SCORE <b id="score">0</b></span>
+  <span>LVL <b id="level">1</b></span>
+  <span><b id="pct">0</b>%<span id="pctbar"><span id="pctfill"></span><span id="pctmark"></span></span></span>
+  <span id="lives">♥♥♥</span>
+  <span id="mute" style="cursor:pointer;font-size:18px;padding:0 4px">🔊</span>
+</div>
+<canvas id="c"></canvas>
+<div id="overlay"><div id="panel"></div></div>
+
+<script>
+(() => {
+'use strict';
+
+// ---------- Constants ----------
+const EMPTY = 0, CLAIMED = 1, TRAIL = 2;
+const COLS = 96;
+const TARGET = 75;          // percent needed to clear a level
+const TICK = 1000 / 60;
+const PLAYER_SPEED = 30;    // cells per second
+const FUSE_DELAY = 0.5;     // seconds standing still while drawing before the fuse lights
+const FUSE_SPEED = 14;      // trail cells per second
+
+// ---------- DOM ----------
+const cvs = document.getElementById('c');
+const ctx = cvs.getContext('2d');
+const off = document.createElement('canvas');
+const octx = off.getContext('2d');
+const hud = document.getElementById('hud');
+const overlay = document.getElementById('overlay');
+const panel = document.getElementById('panel');
+const elScore = document.getElementById('score');
+const elLevel = document.getElementById('level');
+const elPct = document.getElementById('pct');
+const elPctFill = document.getElementById('pctfill');
+const elLives = document.getElementById('lives');
+
+// ---------- State ----------
+let ROWS = 140, N = 0;
+let grid, edge, img;
+let cs = 4, ox = 0, oy = 0, dpr = 1, viewW = 0, viewH = 0;
+let state = 'title';
+let level = 1, lives = 3, score = 0;
+let hiscore = +(localStorage.getItem('kronkel-hi') || 0);
+let player = { x: 0, y: 0 };
+let drawing = false, trail = [], fuse = -1, still = 0, invuln = 0, moveAcc = 0;
+let enemies = [], sparks = [], particles = [];
+let totalInner = 1, claimedInner = 0;
+let dieTimer = 0, time = 0, flash = 0;
+let dir = null;
+let palette;
+
+// ---------- Helpers ----------
+const idx = (x, y) => y * COLS + x;
+const inb = (x, y) => x >= 0 && y >= 0 && x < COLS && y < ROWS;
+const rand = (a, b) => a + Math.random() * (b - a);
+function cellF(x, y) {
+  const cx = Math.floor(x), cy = Math.floor(y);
+  return inb(cx, cy) ? grid[idx(cx, cy)] : CLAIMED;
+}
+function hsl(h, s, l) {
+  s /= 100; l /= 100;
+  const k = n => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  return [f(0) * 255 | 0, f(8) * 255 | 0, f(4) * 255 | 0];
+}
+
+// ---------- Audio ----------
+let actx = null, master = null, drone = null;
+let muted = localStorage.getItem('kronkel-mute') === '1';
+function initAudio() {
+  if (actx) return;
+  try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { actx = null; return; }
+  master = actx.createGain();
+  master.gain.value = muted ? 0 : 1;
+  master.connect(actx.destination);
+  initDrone();
+}
+
+// The Kronkel's high-voltage sound: a mains-like buzz plus random crackling discharges.
+function initDrone() {
+  // white noise source for the crackles
+  const len = actx.sampleRate * 2;
+  const buf = actx.createBuffer(1, len, actx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+  const noise = actx.createBufferSource();
+  noise.buffer = buf; noise.loop = true;
+  const crackFilter = actx.createBiquadFilter();
+  crackFilter.type = 'bandpass'; crackFilter.Q.value = 1.2; crackFilter.frequency.value = 3000;
+  const crackGain = actx.createGain(); crackGain.gain.value = 0;
+  noise.connect(crackFilter); crackFilter.connect(crackGain); crackGain.connect(master);
+
+  // transformer-style buzz: harsh square waves, slightly distorted, through a lowpass
+  const b1 = actx.createOscillator(), b2 = actx.createOscillator();
+  b1.type = 'square'; b2.type = 'sawtooth';
+  b1.frequency.value = 100; b2.frequency.value = 150;
+  const shaper = actx.createWaveShaper();
+  const curve = new Float32Array(256);
+  for (let i = 0; i < 256; i++) { const x = i / 128 - 1; curve[i] = Math.tanh(x * 4); }
+  shaper.curve = curve;
+  const buzzFilter = actx.createBiquadFilter();
+  buzzFilter.type = 'lowpass'; buzzFilter.frequency.value = 900;
+  const buzzGain = actx.createGain(); buzzGain.gain.value = 0;
+  b1.connect(shaper); b2.connect(shaper); shaper.connect(buzzFilter); buzzFilter.connect(buzzGain); buzzGain.connect(master);
+
+  noise.start(); b1.start(); b2.start();
+  drone = { crackFilter, crackGain, buzzFilter, buzzGain, b1, b2 };
+}
+function updateDrone() {
+  if (!drone) return;
+  const t = actx.currentTime;
+  const active = (state === 'play' || state === 'dying') && enemies.length;
+  if (!active) {
+    drone.buzzGain.gain.setTargetAtTime(0, t, 0.05);
+    drone.crackGain.gain.setTargetAtTime(0, t, 0.02);
+    return;
+  }
+  const e = enemies[0];
+  const lf = 0.5 + 0.5 * Math.sin(e.phase);          // how stretched the Kronkel is (0..1)
+  const damp = state === 'dying' ? 0.3 : 1;
+
+  // buzz: flickers in strength like an unstable arc, brighter when stretched
+  const flick = 0.6 + Math.random() * 0.4;
+  drone.buzzGain.gain.setTargetAtTime(0.022 * flick * (0.6 + lf * 0.6) * damp * Math.min(enemies.length, 2), t, 0.01);
+  drone.buzzFilter.frequency.setTargetAtTime(500 + lf * 1500, t, 0.03);
+  const wob = 1 + Math.sin(e.ang * 3) * 0.03;
+  drone.b1.frequency.setTargetAtTime(100 * wob, t, 0.02);
+  drone.b2.frequency.setTargetAtTime(150 * wob, t, 0.02);
+
+  // crackles: random short sparks, more often and louder when stretched
+  if (Math.random() < (0.12 + lf * 0.35) * damp) {
+    const peak = (0.08 + Math.random() * 0.22) * damp;
+    const dur = 0.01 + Math.random() * 0.05;
+    const g = drone.crackGain.gain;
+    g.cancelScheduledValues(t);
+    g.setValueAtTime(peak, t);
+    g.exponentialRampToValueAtTime(0.0005, t + dur);
+    drone.crackFilter.frequency.setValueAtTime(1500 + Math.random() * 6000, t);
+  }
+}
+function setMuted(m) {
+  muted = m;
+  localStorage.setItem('kronkel-mute', m ? '1' : '0');
+  document.getElementById('mute').textContent = m ? '🔇' : '🔊';
+  if (master) master.gain.setTargetAtTime(m ? 0 : 1, actx.currentTime, 0.02);
+}
+function beep(freq, dur, type = 'square', vol = 0.05, slideTo = 0) {
+  if (!actx) return;
+  const t = actx.currentTime;
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(freq, t);
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(master);
+  o.start(t); o.stop(t + dur);
+}
+
+// ---------- Layout ----------
+function hudH() { return hud.offsetHeight; }
+function chooseRows() {
+  const w = innerWidth - 12, h = innerHeight - hudH() - 12;
+  ROWS = Math.max(60, Math.min(200, Math.round(COLS * h / w)));
+}
+function layout() {
+  const top = hudH();
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  viewW = innerWidth; viewH = innerHeight - top;
+  cvs.style.top = top + 'px';
+  cvs.style.width = viewW + 'px';
+  cvs.style.height = viewH + 'px';
+  cvs.width = Math.round(viewW * dpr);
+  cvs.height = Math.round(viewH * dpr);
+  const pad = 6;
+  cs = Math.min((viewW - pad * 2) / COLS, (viewH - pad * 2) / ROWS);
+  ox = (viewW - cs * COLS) / 2;
+  oy = (viewH - cs * ROWS) / 2;
+}
+addEventListener('resize', () => { if (grid) layout(); });
+
+// ---------- Level setup ----------
+function initLevel() {
+  chooseRows();
+  N = COLS * ROWS;
+  grid = new Uint8Array(N);
+  edge = new Uint8Array(N);
+  for (let y = 0; y < ROWS; y++)
+    for (let x = 0; x < COLS; x++)
+      if (x === 0 || y === 0 || x === COLS - 1 || y === ROWS - 1) grid[idx(x, y)] = CLAIMED;
+  totalInner = (COLS - 2) * (ROWS - 2);
+  claimedInner = 0;
+  computeEdges();
+
+  off.width = COLS; off.height = ROWS;
+  img = octx.createImageData(COLS, ROWS);
+
+  const hue = (200 + level * 67) % 360;
+  palette = {
+    hue,
+    empty: [6, 6, 18],
+    fillA: hsl(hue, 70, 28),
+    fillB: hsl(hue, 70, 22),
+    edge: hsl(hue, 100, 78),
+  };
+
+  player = { x: COLS >> 1, y: ROWS - 1 };
+  drawing = false; trail = []; fuse = -1; still = 0; invuln = 1.5; moveAcc = 0;
+  particles = [];
+
+  enemies = [];
+  const nE = level >= 6 ? 3 : level >= 3 ? 2 : 1;
+  for (let i = 0; i < nE; i++) enemies.push(makeEnemy(i));
+
+  sparks = [];
+  const nS = Math.min(1 + Math.floor(level / 2), 5);
+  for (let i = 0; i < nS; i++) {
+    const x = Math.floor((COLS - 1) * (i + 0.5) / nS);
+    sparks.push({ x, y: 0, px: -1, py: -1, dx: i % 2 ? 1 : -1, dy: 0, acc: 0 });
+  }
+  layout();
+  updateHud();
+}
+
+function makeEnemy(i) {
+  const sp = Math.min(0.28 + level * 0.035, 0.7);
+  const a = rand(0, Math.PI * 2);
+  return {
+    x: rand(COLS * 0.3, COLS * 0.7),
+    y: rand(ROWS * 0.25, ROWS * 0.55),
+    vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+    ang: rand(0, Math.PI), w: rand(0.04, 0.09) * (Math.random() < 0.5 ? -1 : 1),
+    len: Math.min(9 + level * 1.2, 20),
+    phase: rand(0, 10),
+    hue: (palette.hue + 160 + i * 50) % 360,
+    hist: [],
+  };
+}
+
+function computeEdges() {
+  for (let y = 0; y < ROWS; y++) {
+    for (let x = 0; x < COLS; x++) {
+      const i = idx(x, y);
+      if (grid[i] !== CLAIMED) { edge[i] = 0; continue; }
+      let e = 0;
+      for (let dy = -1; dy <= 1 && !e; dy++)
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if (inb(nx, ny) && grid[idx(nx, ny)] !== CLAIMED) { e = 1; break; }
+        }
+      edge[i] = e;
+    }
+  }
+}
+
+// ---------- Player ----------
+function playerStep() {
+  if (!dir) return false;
+  const nx = player.x + dir.x, ny = player.y + dir.y;
+  if (!inb(nx, ny)) return false;
+  const i = idx(nx, ny), c = grid[i];
+  if (!drawing) {
+    if (c === CLAIMED) {
+      if (!edge[i]) return false;
+      player.x = nx; player.y = ny;
+      return true;
+    }
+    if (c === EMPTY) {
+      drawing = true;
+      trail = [idx(player.x, player.y), i];
+      grid[i] = TRAIL;
+      player.x = nx; player.y = ny;
+      beep(660, 0.04, 'square', 0.025);
+      return true;
+    }
+    return false;
+  }
+  // drawing
+  if (c === EMPTY) {
+    grid[i] = TRAIL; trail.push(i);
+    player.x = nx; player.y = ny;
+    return true;
+  }
+  if (c === CLAIMED) {
+    player.x = nx; player.y = ny;
+    closeArea();
+    return true;
+  }
+  return false; // own trail blocks
+}
+
+function nearestCell(i0, test) {
+  const x0 = i0 % COLS, y0 = (i0 / COLS) | 0;
+  if (test(i0)) return i0;
+  const maxR = Math.max(COLS, ROWS);
+  for (let r = 1; r < maxR; r++) {
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
+        const x = x0 + dx, y = y0 + dy;
+        if (!inb(x, y)) continue;
+        const i = idx(x, y);
+        if (test(i)) return i;
+      }
+    }
+  }
+  return -1;
+}
+
+function closeArea() {
+  let gained = 0;
+  for (let k = 1; k < trail.length; k++) { grid[trail[k]] = CLAIMED; gained++; }
+  trail = []; drawing = false; fuse = -1; still = 0;
+
+  // Flood fill from every enemy: whatever they can reach stays open.
+  const mark = new Uint8Array(N);
+  const stack = [];
+  for (const e of enemies) {
+    let i = idx(Math.floor(e.x), Math.floor(e.y));
+    if (grid[i] !== EMPTY) {
+      i = nearestCell(i, j => grid[j] === EMPTY);
+      if (i < 0) continue;
+      e.x = (i % COLS) + 0.5; e.y = ((i / COLS) | 0) + 0.5;
+    }
+    if (!mark[i]) { mark[i] = 1; stack.push(i); }
+  }
+  while (stack.length) {
+    const i = stack.pop();
+    const x = i % COLS, y = (i / COLS) | 0;
+    if (x > 0 && grid[i - 1] === EMPTY && !mark[i - 1]) { mark[i - 1] = 1; stack.push(i - 1); }
+    if (x < COLS - 1 && grid[i + 1] === EMPTY && !mark[i + 1]) { mark[i + 1] = 1; stack.push(i + 1); }
+    if (y > 0 && grid[i - COLS] === EMPTY && !mark[i - COLS]) { mark[i - COLS] = 1; stack.push(i - COLS); }
+    if (y < ROWS - 1 && grid[i + COLS] === EMPTY && !mark[i + COLS]) { mark[i + COLS] = 1; stack.push(i + COLS); }
+  }
+  let area = 0;
+  for (let i = 0; i < N; i++) {
+    if (grid[i] === EMPTY && !mark[i]) { grid[i] = CLAIMED; area++; }
+  }
+  gained += area;
+  claimedInner += gained;
+  computeEdges();
+
+  // player may end up deep inside claimed land (e.g. a trail hugging the border): move to nearest edge
+  const pi = idx(player.x, player.y);
+  if (!edge[pi]) {
+    const j = nearestCell(pi, k => grid[k] === CLAIMED && edge[k] === 1);
+    if (j >= 0) { player.x = j % COLS; player.y = (j / COLS) | 0; }
+  }
+
+  // sparks that are no longer on an edge jump to the nearest edge
+  for (const s of sparks) {
+    const i = idx(s.x, s.y);
+    if (!(grid[i] === CLAIMED && edge[i])) {
+      const j = nearestCell(i, k => grid[k] === CLAIMED && edge[k] === 1);
+      if (j >= 0) { s.x = j % COLS; s.y = (j / COLS) | 0; s.px = -1; s.py = -1; }
+    }
+  }
+
+  const pts = gained * 10 * level;
+  score += pts;
+  flash = Math.min(1, 0.25 + gained / 1500);
+  beep(300 + Math.min(gained, 1500) / 2, 0.18, 'triangle', 0.07, 900);
+  updateHud();
+
+  if (pct() >= TARGET) levelClear();
+}
+
+function pct() { return claimedInner / totalInner * 100; }
+
+// ---------- Enemies ----------
+function enemyStep(e) {
+  // keep the enemy inside open space
+  if (cellF(e.x, e.y) !== EMPTY) {
+    const i = nearestCell(idx(Math.floor(e.x), Math.floor(e.y)), j => grid[j] === EMPTY);
+    if (i >= 0) { e.x = (i % COLS) + 0.5; e.y = ((i / COLS) | 0) + 0.5; }
+  }
+  if (Math.random() < 0.025) {
+    const sp = Math.hypot(e.vx, e.vy);
+    const a = Math.atan2(e.vy, e.vx) + rand(-0.9, 0.9);
+    e.vx = Math.cos(a) * sp; e.vy = Math.sin(a) * sp;
+  }
+  if (Math.random() < 0.01) e.w = -e.w;
+
+  if (cellF(e.x + e.vx, e.y + e.vy) !== EMPTY) {
+    if (cellF(e.x - e.vx, e.y + e.vy) === EMPTY) e.vx = -e.vx;
+    else if (cellF(e.x + e.vx, e.y - e.vy) === EMPTY) e.vy = -e.vy;
+    else { e.vx = -e.vx; e.vy = -e.vy; }
+  }
+  if (cellF(e.x + e.vx, e.y + e.vy) === EMPTY) { e.x += e.vx; e.y += e.vy; }
+
+  e.ang += e.w;
+  e.phase += 0.05;
+  const len = e.len * (0.55 + 0.45 * Math.sin(e.phase));
+  const c = Math.cos(e.ang), s = Math.sin(e.ang);
+  const pIdx = idx(player.x, player.y);
+  let hit = false;
+  const ends = [];
+  for (const sg of [1, -1]) {
+    let lx = e.x, ly = e.y;
+    for (let d = 0; d <= len; d += 0.4) {
+      const x = e.x + c * d * sg, y = e.y + s * d * sg;
+      const cx = Math.floor(x), cy = Math.floor(y);
+      if (!inb(cx, cy)) break;
+      const i = idx(cx, cy);
+      if (drawing && i === pIdx) hit = true;
+      if (grid[i] !== EMPTY) { if (grid[i] === TRAIL) hit = true; break; }
+      lx = x; ly = y;
+    }
+    ends.push(lx, ly);
+  }
+  e.hist.push(ends);
+  if (e.hist.length > 12) e.hist.shift();
+  return hit;
+}
+
+// ---------- Sparks ----------
+const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+function sparkStep(s) {
+  const ok = (x, y) => inb(x, y) && grid[idx(x, y)] === CLAIMED && edge[idx(x, y)] === 1;
+  const opts = [];
+  for (const [dx, dy] of DIRS) {
+    const nx = s.x + dx, ny = s.y + dy;
+    if (nx === s.px && ny === s.py) continue;
+    if (ok(nx, ny)) opts.push([dx, dy]);
+  }
+  let ch;
+  if (!opts.length) {
+    if (s.px >= 0 && ok(s.px, s.py)) ch = [s.px - s.x, s.py - s.y]; else return;
+  } else {
+    const same = opts.find(o => o[0] === s.dx && o[1] === s.dy);
+    ch = (same && Math.random() < 0.85) ? same : opts[(Math.random() * opts.length) | 0];
+  }
+  s.px = s.x; s.py = s.y;
+  s.x += ch[0]; s.y += ch[1];
+  s.dx = ch[0]; s.dy = ch[1];
+}
+
+// ---------- Death / level flow ----------
+function die() {
+  if (state !== 'play') return;
+  state = 'dying';
+  dieTimer = 1.3;
+  lives--;
+  beep(440, 0.7, 'sawtooth', 0.08, 60);
+  if (navigator.vibrate) navigator.vibrate(200);
+  const cx = player.x + 0.5, cy = player.y + 0.5;
+  for (let k = 0; k < 60; k++) {
+    const a = rand(0, Math.PI * 2), v = rand(0.1, 0.9);
+    particles.push({ x: cx, y: cy, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: rand(0.6, 1.3), hue: rand(0, 60) });
+  }
+  updateHud();
+}
+
+function respawn() {
+  if (drawing) {
+    for (let k = 1; k < trail.length; k++) grid[trail[k]] = EMPTY;
+    const s = trail[0];
+    player.x = s % COLS; player.y = (s / COLS) | 0;
+  }
+  drawing = false; trail = []; fuse = -1; still = 0; moveAcc = 0;
+  invuln = 2;
+  if (lives <= 0) gameOver();
+  else state = 'play';
+}
+
+function levelClear() {
+  state = 'clear';
+  const p = pct();
+  const bonus = Math.round((p - TARGET) * 500 * level) + 1000 * level;
+  score += bonus;
+  updateHud();
+  [523, 659, 784, 1046].forEach((f, k) => setTimeout(() => beep(f, 0.18, 'square', 0.05), k * 120));
+  showOverlay(`<h2>LEVEL ${level} GEHAALD!</h2>
+    <p>${p.toFixed(1)}% veroverd</p>
+    <p>Bonus: <b>${bonus}</b></p>
+    <button id="go">Volgende level</button>`, () => { level++; initLevel(); state = 'play'; });
+}
+
+function gameOver() {
+  state = 'over';
+  if (score > hiscore) { hiscore = score; localStorage.setItem('kronkel-hi', hiscore); }
+  showOverlay(`<h2>GAME OVER</h2>
+    <p>Score: <b>${score}</b></p>
+    <p>Highscore: <b>${hiscore}</b></p>
+    <button id="go">Opnieuw</button>`, newGame);
+}
+
+function newGame() {
+  level = 1; lives = 3; score = 0;
+  initLevel();
+  state = 'play';
+}
+
+function showOverlay(html, onGo) {
+  panel.innerHTML = html;
+  overlay.classList.remove('hidden');
+  dir = null;
+  const btn = document.getElementById('go');
+  const go = (ev) => {
+    ev.preventDefault(); ev.stopPropagation();
+    initAudio();
+    if (actx && actx.state === 'suspended') actx.resume();
+    overlay.classList.add('hidden');
+    onGo();
+  };
+  btn.addEventListener('pointerup', go, { once: true });
+}
+
+function updateHud() {
+  elScore.textContent = score;
+  elLevel.textContent = level;
+  const p = grid ? pct() : 0;
+  elPct.textContent = p.toFixed(0);
+  elPctFill.style.width = Math.min(100, p) + '%';
+  elPctFill.style.background = p >= TARGET ? '#ff0' : '#4f8';
+  elLives.textContent = '♥'.repeat(Math.max(0, lives)) || '–';
+  elLives.style.color = '#f46';
+}
+
+// ---------- Update ----------
+function update() {
+  const dt = 1 / 60;
+  time += dt;
+  if (flash > 0) flash = Math.max(0, flash - dt * 2);
+
+  for (const p of particles) { p.x += p.vx; p.y += p.vy; p.vx *= 0.96; p.vy *= 0.96; p.life -= dt; }
+  particles = particles.filter(p => p.life > 0);
+  updateDrone();
+
+  if (state === 'dying') {
+    for (const e of enemies) enemyStep(e);
+    dieTimer -= dt;
+    if (dieTimer <= 0) respawn();
+    return;
+  }
+  if (state !== 'play') return;
+
+  if (invuln > 0) invuln -= dt;
+
+  // player
+  let moved = false;
+  if (!dir) moveAcc = 0;
+  else {
+    moveAcc += PLAYER_SPEED * dt;
+    while (moveAcc >= 1) {
+      moveAcc -= 1;
+      if (playerStep()) moved = true;
+      if (state !== 'play') return;
+    }
+  }
+
+  // fuse: standing still while drawing is dangerous
+  if (drawing) {
+    if (moved) { still = 0; fuse = -1; }
+    else {
+      still += dt;
+      if (still > FUSE_DELAY) {
+        if (fuse < 0) fuse = 0;
+        fuse += FUSE_SPEED * dt;
+        if (Math.random() < 0.3) beep(rand(1500, 2500), 0.02, 'square', 0.015);
+        if (fuse >= trail.length - 1) { die(); return; }
+      }
+    }
+  }
+
+  // enemies
+  for (const e of enemies) {
+    if (enemyStep(e) && invuln <= 0) { die(); return; }
+  }
+
+  // sparks
+  const spSpeed = Math.min(12 + level * 1.5, 24);
+  for (const s of sparks) {
+    s.acc += spSpeed * dt;
+    while (s.acc >= 1) {
+      s.acc -= 1;
+      sparkStep(s);
+      const hitNow = s.x === player.x && s.y === player.y;
+      const swapped = s.px === player.x && s.py === player.y && moved;
+      if ((hitNow || swapped) && invuln <= 0) { die(); return; }
+    }
+  }
+}
+
+// ---------- Render ----------
+function render() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#05050f';
+  ctx.fillRect(0, 0, viewW, viewH);
+  if (!grid) return;
+
+  // grid -> image
+  const d = img.data;
+  const P = palette;
+  const trailCol = (Math.floor(time * 12) % 2) ? [255, 255, 120] : [255, 200, 40];
+  for (let y = 0; y < ROWS; y++) {
+    for (let x = 0; x < COLS; x++) {
+      const i = idx(x, y), o = i * 4;
+      let c;
+      const g = grid[i];
+      if (g === EMPTY) c = P.empty;
+      else if (g === TRAIL) c = trailCol;
+      else if (edge[i]) c = P.edge;
+      else c = (((x + y) >> 2) & 1) ? P.fillA : P.fillB;
+      d[o] = c[0]; d[o + 1] = c[1]; d[o + 2] = c[2]; d[o + 3] = 255;
+    }
+  }
+  octx.putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(off, ox, oy, COLS * cs, ROWS * cs);
+
+  if (flash > 0) {
+    ctx.fillStyle = `rgba(255,255,255,${flash * 0.35})`;
+    ctx.fillRect(ox, oy, COLS * cs, ROWS * cs);
+  }
+
+  const X = x => ox + x * cs, Y = y => oy + y * cs;
+
+  // enemies: glowing rotating line with afterimages
+  ctx.lineCap = 'round';
+  for (const e of enemies) {
+    const n = e.hist.length;
+    for (let k = 0; k < n; k++) {
+      const h = e.hist[k];
+      const a = (k + 1) / n;
+      ctx.strokeStyle = `hsla(${(e.hue + k * 9 + time * 120) % 360},100%,${55 + a * 15}%,${a})`;
+      ctx.lineWidth = Math.max(1.5, cs * (0.3 + a * 0.5));
+      ctx.beginPath();
+      ctx.moveTo(X(h[0]), Y(h[1]));
+      ctx.lineTo(X(h[2]), Y(h[3]));
+      ctx.stroke();
+    }
+    // core
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(X(e.x), Y(e.y), Math.max(2, cs * 0.6), 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // fuse
+  if (drawing && fuse >= 0 && trail.length > 1) {
+    const i = trail[Math.min(trail.length - 1, Math.floor(fuse))];
+    const fx = X(i % COLS + 0.5), fy = Y(((i / COLS) | 0) + 0.5);
+    ctx.fillStyle = Math.random() < 0.5 ? '#f80' : '#fff';
+    ctx.beginPath();
+    ctx.arc(fx, fy, Math.max(3, cs * rand(0.8, 1.4)), 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // sparks
+  for (const s of sparks) {
+    const sx = X(s.x + 0.5), sy = Y(s.y + 0.5);
+    const r = Math.max(4, cs * 1.3);
+    ctx.strokeStyle = Math.random() < 0.5 ? '#f33' : '#fff';
+    ctx.lineWidth = Math.max(1.5, cs * 0.35);
+    ctx.beginPath();
+    for (let k = 0; k < 4; k++) {
+      const a = time * 10 + k * Math.PI / 4;
+      ctx.moveTo(sx - Math.cos(a) * r, sy - Math.sin(a) * r);
+      ctx.lineTo(sx + Math.cos(a) * r, sy + Math.sin(a) * r);
+    }
+    ctx.stroke();
+  }
+
+  // player
+  if (state === 'play' || state === 'clear') {
+    const blink = invuln > 0 && Math.floor(time * 10) % 2;
+    if (!blink) {
+      const px = X(player.x + 0.5), py = Y(player.y + 0.5);
+      const r = Math.max(5, cs * 1.4);
+      ctx.fillStyle = drawing ? '#ff0' : '#0f8';
+      ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(px, py, r + 2, 0, Math.PI * 2); ctx.stroke();
+    }
+  }
+
+  // particles
+  for (const p of particles) {
+    ctx.fillStyle = `hsla(${p.hue},100%,60%,${Math.min(1, p.life)})`;
+    ctx.fillRect(X(p.x) - 2, Y(p.y) - 2, 4, 4);
+  }
+
+  // virtual joystick indicator
+  if (touch.id !== null) {
+    ctx.strokeStyle = 'rgba(255,255,255,.25)';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(touch.ax, touch.ay - hudH(), JOY_R, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,.35)';
+    ctx.beginPath(); ctx.arc(touch.cx, touch.cy - hudH(), 14, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+// ---------- Input: floating joystick ----------
+const JOY_R = 40, DEAD = 10;
+const touch = { id: null, ax: 0, ay: 0, cx: 0, cy: 0 };
+
+function setDirFrom(dx, dy) {
+  if (Math.hypot(dx, dy) < DEAD) return;
+  dir = Math.abs(dx) > Math.abs(dy) ? { x: Math.sign(dx), y: 0 } : { x: 0, y: Math.sign(dy) };
+}
+document.addEventListener('pointerdown', e => {
+  if (!overlay.classList.contains('hidden')) return;
+  initAudio();
+  if (touch.id !== null) return;
+  touch.id = e.pointerId;
+  touch.ax = touch.cx = e.clientX;
+  touch.ay = touch.cy = e.clientY;
+  e.preventDefault();
+}, { passive: false });
+document.addEventListener('pointermove', e => {
+  if (e.pointerId !== touch.id) return;
+  touch.cx = e.clientX; touch.cy = e.clientY;
+  let dx = touch.cx - touch.ax, dy = touch.cy - touch.ay;
+  const m = Math.hypot(dx, dy);
+  if (m > JOY_R) { // drag the anchor along so direction changes stay responsive
+    touch.ax += dx * (1 - JOY_R / m);
+    touch.ay += dy * (1 - JOY_R / m);
+    dx = touch.cx - touch.ax; dy = touch.cy - touch.ay;
+  }
+  setDirFrom(dx, dy);
+  e.preventDefault();
+}, { passive: false });
+const endTouch = e => {
+  if (e.pointerId !== touch.id) return;
+  touch.id = null;
+  dir = null;
+};
+document.addEventListener('pointerup', endTouch);
+document.addEventListener('pointercancel', endTouch);
+document.addEventListener('contextmenu', e => e.preventDefault());
+
+// mute toggle
+const muteBtn = document.getElementById('mute');
+muteBtn.textContent = muted ? '🔇' : '🔊';
+muteBtn.addEventListener('pointerdown', e => {
+  e.stopPropagation(); e.preventDefault();
+  initAudio();
+  if (actx && actx.state === 'suspended') actx.resume();
+  setMuted(!muted);
+});
+addEventListener('keydown', e => { if (e.key === 'm' || e.key === 'M') setMuted(!muted); });
+
+// silence when the tab/app goes to the background
+document.addEventListener('visibilitychange', () => {
+  if (!actx) return;
+  if (document.hidden) actx.suspend(); else actx.resume();
+});
+
+// keyboard (desktop)
+const KEYS = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1], a: [-1, 0], d: [1, 0], w: [0, -1], s: [0, 1] };
+const held = [];
+addEventListener('keydown', e => {
+  const k = KEYS[e.key]; if (!k) return;
+  e.preventDefault(); initAudio();
+  if (!held.includes(e.key)) held.push(e.key);
+  dir = { x: k[0], y: k[1] };
+});
+addEventListener('keyup', e => {
+  const i = held.indexOf(e.key); if (i < 0) return;
+  held.splice(i, 1);
+  if (held.length) { const k = KEYS[held[held.length - 1]]; dir = { x: k[0], y: k[1] }; }
+  else if (touch.id === null) dir = null;
+});
+
+// ---------- Main loop ----------
+let last = performance.now(), acc = 0;
+function frame(t) {
+  acc += Math.min(100, t - last);
+  last = t;
+  while (acc >= TICK) { update(); acc -= TICK; }
+  render();
+  requestAnimationFrame(frame);
+}
+
+// ---------- Start ----------
+layout();
+initLevel();
+showOverlay(`<h1>KRONKEL</h1>
+  <p>Sleep met je vinger in een richting om te bewegen. Laat los om te stoppen.</p>
+  <p>Verlaat de rand om een lijn te trekken. Sluit hem weer aan op de rand om dat stuk veld te veroveren.</p>
+  <p>Verover <b>${TARGET}%</b> om naar het volgende level te gaan.</p>
+  <p>Pas op voor de <b style="color:#f0f">Kronkel</b>: raakt hij je lijn, dan ben je af. De <b style="color:#f33">vonken</b> jagen langs de randen. Sta je stil tijdens het tekenen? Dan brandt er een <b style="color:#f80">lont</b> langs je lijn.</p>
+  <p class="small">Toetsenbord: pijltjes of WASD · Highscore: ${hiscore}</p>
+  <button id="go">START</button>`, newGame);
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
