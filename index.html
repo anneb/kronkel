@@ -92,6 +92,7 @@ let state = 'title';
 let level = 1, lives = 3, score = 0;
 let hiscore = +(localStorage.getItem('kronkel-hi') || 0);
 let player = { x: 0, y: 0 };
+let trapped = false;
 let drawing = false, trail = [], fuse = -1, still = 0, invuln = 0, moveAcc = 0;
 let enemies = [], sparks = [], particles = [];
 let totalInner = 1, claimedInner = 0;
@@ -256,7 +257,7 @@ function initLevel() {
   };
 
   player = { x: COLS >> 1, y: ROWS - 1 };
-  drawing = false; trail = []; fuse = -1; still = 0; invuln = 1.5; moveAcc = 0;
+  drawing = false; trail = []; fuse = -1; still = 0; trapped = false; invuln = 1.5; moveAcc = 0;
   particles = [];
 
   enemies = [];
@@ -361,7 +362,7 @@ function nearestCell(i0, test) {
 function closeArea() {
   let gained = 0;
   for (let k = 1; k < trail.length; k++) { grid[trail[k]] = CLAIMED; gained++; }
-  trail = []; drawing = false; fuse = -1; still = 0;
+  trail = []; drawing = false; fuse = -1; still = 0; trapped = false;
 
   // Flood fill from every enemy: whatever they can reach stays open.
   const mark = new Uint8Array(N);
@@ -414,6 +415,16 @@ function closeArea() {
   updateHud();
 
   if (pct() >= TARGET) levelClear();
+}
+
+// drawing and boxed in by our own trail on all sides: no legal move left
+function isTrapped() {
+  if (!drawing) return false;
+  for (const [dx, dy] of DIRS) {
+    const nx = player.x + dx, ny = player.y + dy;
+    if (inb(nx, ny) && grid[idx(nx, ny)] !== TRAIL) return false;
+  }
+  return true;
 }
 
 function pct() { return claimedInner / totalInner * 100; }
@@ -508,7 +519,7 @@ function respawn() {
     const s = trail[0];
     player.x = s % COLS; player.y = (s / COLS) | 0;
   }
-  drawing = false; trail = []; fuse = -1; still = 0; moveAcc = 0;
+  drawing = false; trail = []; fuse = -1; still = 0; trapped = false; moveAcc = 0;
   invuln = 2;
   if (lives <= 0) gameOver();
   else state = 'play';
@@ -600,14 +611,24 @@ function update() {
     }
   }
 
+  if (!drawing) trapped = false;
+
   // fuse: standing still while drawing is dangerous
   if (drawing) {
+    const wasTrapped = trapped;
+    trapped = !moved && isTrapped();
+    if (trapped && !wasTrapped) {
+      beep(220, 0.5, 'sawtooth', 0.06, 110);
+      if (navigator.vibrate) navigator.vibrate([60, 40, 60]);
+    }
     if (moved) { still = 0; fuse = -1; }
     else {
       still += dt;
-      if (still > FUSE_DELAY) {
+      if (trapped || still > FUSE_DELAY) {
         if (fuse < 0) fuse = 0;
-        fuse += FUSE_SPEED * dt;
+        // when hopelessly trapped the fuse races to the player within about a second
+        const speed = trapped ? Math.max(FUSE_SPEED, (trail.length - 1) / 0.9) : FUSE_SPEED;
+        fuse += speed * dt;
         if (Math.random() < 0.3) beep(rand(1500, 2500), 0.02, 'square', 0.015);
         if (fuse >= trail.length - 1) { die(); return; }
       }
@@ -724,6 +745,15 @@ function render() {
       ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.arc(px, py, r + 2, 0, Math.PI * 2); ctx.stroke();
     }
+  }
+
+  // trapped warning
+  if (trapped && state === 'play') {
+    const fs = Math.max(26, Math.min(56, viewW / 9));
+    ctx.font = `900 ${fs}px ui-monospace, Menlo, Consolas, monospace`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = Math.floor(time * 8) % 2 ? '#f40' : '#ff0';
+    ctx.fillText('VERSTRIKT!', viewW / 2, viewH / 2);
   }
 
   // particles
